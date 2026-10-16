@@ -314,20 +314,10 @@ docker exec -it turtlebot_patrol_sim bash
 ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: true}"
 ```
 
----
-
-## 9. Demonstration Video Recording Checklist
-
-A 1-minute video demonstration should showcase:
-1. **0:00 - 0:15**: Launching `ros2 launch turtlebot_patrol patrol_simulation.launch.py` and observing the robot patrol its square route.
-2. **0:15 - 0:30**: Encountering an obstacle, front detection trigger, in-place rotation toward open space, and resumed patrol.
-3. **0:30 - 0:45**: Calling `ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: true}"` with immediate robot halt.
-4. **0:45 - 0:55**: Calling `ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: false}"` with robot resuming motion.
-5. **0:55 - 1:00**: Showing `/robot_telemetry` printout and `telemetry_log.csv`.
 
 ---
 
-## 10. Authors & License
+## 9. Authors & License
 
 - **Author**: Apoorva Tiwari
 - **Repository**: [github.com/ApoorvaTiwari07/ros-task](https://github.com/ApoorvaTiwari07/ros-task)
