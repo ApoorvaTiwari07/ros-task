@@ -1,1 +1,0 @@
-"""TurtleBot Patrol package."""
