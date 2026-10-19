@@ -1,0 +1,46 @@
+lidar_obstacle_detector:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38
+    max_range: 3.5
+    front_angle_min_deg: -22.0
+    front_angle_max_deg: 22.0
+    left_angle_min_deg: 22.0
+    left_angle_max_deg: 90.0
+    right_angle_min_deg: -90.0
+    right_angle_max_deg: -22.0
+
+obstacle_detector:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38
+    max_range: 3.5
+    front_angle_min_deg: -22.0
+    front_angle_max_deg: 22.0
+    left_angle_min_deg: 22.0
+    left_angle_max_deg: 90.0
+    right_angle_min_deg: -90.0
+    right_angle_max_deg: -22.0
+
+patrol_controller:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38
+    safe_resume_distance: 0.48
+    linear_speed: 0.12
+    angular_speed: 0.28
+    square_size: 0.8
+    waypoint_tolerance: 0.18
+    stuck_timeout: 3.0
+    max_recovery_attempts: 3
+    scan_timeout: 1.5
+    odom_timeout: 1.5
+    waypoints: [-2.0, -0.5, -1.4, -0.5, -1.4, 0.5, -2.0, 0.5]
+
+emergency_stop_server:
+  ros__parameters:
+    publish_rate: 10.0
+
+telemetry_logger:
+  ros__parameters:
+    telemetry_period: 1.0
+    initial_battery: 100.0
+    battery_drain_rate: 0.1
+    csv_file_path: "telemetry_log.csv"
