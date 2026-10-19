@@ -1,324 +1,254 @@
-# Autonomous TurtleBot3 Patrol & Obstacle Avoidance
+# Autonomous TurtleBot Patrol & Obstacle Avoidance
 
-[![ROS 2](https://img.shields.io/badge/ROS_2-Humble%20%7C%20Jazzy-22314E?logo=ros&logoColor=white)](https://docs.ros.org/)
-[![Simulation](https://img.shields.io/badge/Simulation-Gazebo-orange)](https://gazebosim.org/)
-[![Robot](https://img.shields.io/badge/Robot-TurtleBot3%20Burger%2FWaffle-green)](https://emanual.robotis.com/docs/en/platform/turtlebot3/overview/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-
-A modular, production-ready ROS 2 software stack for a **TurtleBot3** robot operating autonomously inside a simulated Gazebo environment. The system executes square or custom waypoint patrol, performs real-time LiDAR-based obstacle detection and evasion, responds to a safety emergency-stop service with immediate halt and resume, and monitors robot telemetry with battery discharge simulation logged to CSV.
+A modular ROS 2 Humble software stack for autonomous waypoint patrolling, LiDAR-based reactive obstacle avoidance, remote emergency stop management, and live telemetry logging on a simulated TurtleBot3 Burger in Gazebo Classic.
 
 ---
 
-## 1. System Architecture
+## 1. Project Objective
 
-The package follows a clean modular ROS 2 architecture partitioned into four dedicated nodes:
+The objective of this project is to build an autonomous navigation and monitoring stack for a differential-drive robot (`TurtleBot3 Burger`) operating in an indoor environment with obstacles.
 
-```mermaid
-flowchart TD
-    subgraph Gazebo Simulation
-        SIM_SCAN["/scan (sensor_msgs/LaserScan)"]
-        SIM_ODOM["/odom (nav_msgs/Odometry)"]
-        SIM_CMD["/cmd_vel (geometry_msgs/Twist)"]
-    end
+Key requirements fulfilled:
+1. **Autonomous Waypoint Patrol**: Follows a predefined square or configured multi-point patrol route using filtered odometry.
+2. **LiDAR Perception & Obstacle Avoidance**: Slices raw 360° laser scans into Front, Left, and Right angular sectors, normalizes angles through $2\pi$, filters out non-return / invalid readings, and turns toward the sector with greater clearance.
+3. **Emergency Stop Service**: A dedicated service and state topic allowing instant stopping and safe resumption without overriding by the controller.
+4. **Telemetry Logging**: Tracks total distance travelled, average linear speed, and motion-dependent simulated battery drain, publishing human-readable updates to `/robot_telemetry` and appending timestamped records to `telemetry_log.csv`.
+5. **Single-Command Launch**: Starts Gazebo Classic, spawns the robot model, and launches all 4 nodes with loaded configuration via one unified launch file.
 
-    subgraph Perception
-        LOD["lidar_obstacle_detector Node"]
-        SIM_SCAN --> LOD
-        LOD -->|/obstacle_status| PC["patrol_controller Node"]
-        LOD -->|/obstacle_markers| RVIZ["RViz2 Visualization"]
-    end
+---
 
-    subgraph Safety & Services
-        ESTOP["emergency_stop_server Node"]
-        OP["Operator / Service Client"] -->|/trigger_estop (std_srvs/SetBool)| ESTOP
-        ESTOP -->|/estop_state (std_msgs/Bool)| PC
-        ESTOP -->|/estop_state (std_msgs/Bool)| TL["telemetry_logger Node"]
-    end
+## 2. System Architecture
 
-    subgraph Decision Making & Motion
-        SIM_ODOM --> PC
-        PC -->|/cmd_vel| SIM_CMD
-        PC -->|/waypoint_markers| RVIZ
-    end
+The software stack is organized into four decoupled nodes:
 
-    subgraph Diagnostics & Logging
-        SIM_ODOM --> TL
-        SIM_CMD --> TL
-        TL -->|/robot_telemetry| MON["Telemetry Monitor"]
-        TL --> CSV["telemetry_log.csv"]
-    end
+```
+                  +---------------------------+
+                  |   Gazebo Classic / Robot   |
+                  +---------------------------+
+                      | /scan          ^ /cmd_vel
+                      v                |
+      +------------------------+       |
+      | lidar_obstacle_detector|       |
+      +------------------------+       |
+                  | /obstacle_status   |
+                  v                    |
+      +--------------------------------+------+
+      |           patrol_controller           |
+      +--------------------------------+------+
+            ^ /odom              ^ /estop_state
+            |                    |
++--------------------+   +-----------------------+
+|  telemetry_logger  |   | emergency_stop_server |
++--------------------+   +-----------------------+
+   |                        ^ /trigger_estop
+   v /robot_telemetry       | (std_srvs/SetBool)
+   + telemetry_log.csv
 ```
 
-### Finite State Machine (FSM)
+### Node Descriptions
 
-The `patrol_controller` operates on a deterministic 3-state machine:
+1. **`lidar_obstacle_detector`**
+   - **Perception layer**: Subscribes to `/scan` (`sensor_msgs/msg/LaserScan`).
+   - Normalizes all ray angles from $[0, 2\pi]$ into $[-\pi, +\pi]$ so left and right sectors are assigned accurately regardless of sensor orientation.
+   - Divides the scan into three sectors:
+     - **Front**: $-30^\circ$ to $+30^\circ$
+     - **Left**: $+30^\circ$ to $+90^\circ$
+     - **Right**: $-90^\circ$ to $-30^\circ$
+   - Computes the minimum valid obstacle distance per sector, filtering out `inf`, `NaN`, and sub-minimum range noise.
+   - Publishes sector clearances on `/obstacle_status` as `[front, left, right]`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> PATROL : Launch / Initialized
+2. **`patrol_controller`**
+   - **Decision & motion control layer**: Implements a robust Finite-State Machine (FSM):
+     - **`PATROL`**: Targets the current waypoint using proportional heading and distance control.
+     - **`AVOID`**: Triggered when `front < obstacle_distance_threshold` (0.50 m). Halts linear movement and rotates toward the clearer side (comparing Left vs. Right clearance).
+     - **`CLEAR`**: Once `front >= safe_resume_distance` (0.65 m hysteresis), executes a cautious forward bypass with side obstacle repulsion before resuming the waypoint heading.
+     - **`RECOVERY`**: Bounded recovery maneuver (cautious reverse and alternate turn) triggered if progress stalls or avoidance times out.
+     - **`BLOCKED`**: Safe zero-velocity state entered if maximum recovery attempts are exceeded without finding a clear exit.
+     - **`HALTED`**: Overrides all motion when `/estop_state` is active.
 
-    PATROL --> AVOID : Front distance < 0.50m
-    AVOID --> PATROL : Front clear >= 0.65m
+3. **`emergency_stop_server`**
+   - **Safety layer**: Provides the `/trigger_estop` service (`std_srvs/srv/SetBool`).
+   - Periodically publishes the current state on `/estop_state` (`std_msgs/msg/Bool`) at 10 Hz.
+   - Calling `data: true` immediately halts the robot; `data: false` safely releases the stop.
 
-    PATROL --> HALTED : /trigger_estop (true)
-    AVOID --> HALTED : /trigger_estop (true)
-
-    HALTED --> PATROL : /trigger_estop (false)
-```
-
-1. **`PATROL`**: Moves along configured square coordinates or waypoints using proportional distance and heading control.
-2. **`AVOID`**: Stops forward motion immediately (`linear.x = 0.0`), samples left vs right sector clearances, rotates toward the open side until the path is cleared, then resumes patrol.
-3. **`HALTED`**: Instantly commands zero velocities (`linear.x = 0.0`, `angular.z = 0.0`) on E-stop. Holds state until explicitly cleared.
-
----
-
-## 2. Package Structure
-
-```text
-turtlebot_patrol/
-├── CMakeLists.txt / setup.py           # Package setup and entry points
-├── package.xml                         # Package dependencies and manifest
-├── README.md                           # Documentation, setup & testing guide
-├── setup.cfg                           # Script install targets
-├── config/
-│   └── patrol_params.yaml              # Configurable parameters
-├── docker/
-│   ├── Dockerfile                      # Standalone Ubuntu 22.04 + ROS 2 Humble image
-│   ├── docker-compose.yml              # Compose configuration
-│   └── entrypoint.sh                   # Container entrypoint script
-├── launch/
-│   └── patrol_simulation.launch.py     # Unified launch file
-├── resource/
-│   └── turtlebot_patrol                # ament resource marker
-├── rviz/
-│   └── patrol.rviz                     # RViz2 configuration with markers
-├── test/
-│   ├── test_copyright.py               # Linter test
-│   ├── test_flake8.py                  # Code style test
-│   ├── test_patrol_logic.py            # Unit tests for logic and math
-│   └── test_pep257.py                  # Docstring test
-└── turtlebot_patrol/
-    ├── __init__.py                     # Python package initializer
-    ├── emergency_stop_server.py        # E-stop service & publisher node
-    ├── lidar_obstacle_detector.py      # 360° LiDAR 3-sector obstacle perception
-    ├── patrol_controller.py            # Waypoint patrol & evasion FSM node
-    └── telemetry_logger.py             # Distance, speed, battery & CSV logger
-```
+4. **`telemetry_logger`**
+   - **Diagnostics layer**: Subscribes to `/odom` and `/cmd_vel`.
+   - Calculates total Euclidean distance travelled, active average linear speed, and simulated battery consumption (starting at 100%, draining 1% per 10s of motion).
+   - Publishes formatted status strings to `/robot_telemetry` (`std_msgs/msg/String`).
+   - Writes periodic timestamped records to `~/robot_ws/telemetry_log.csv` with instant flushing and clean shutdown.
 
 ---
 
-## 3. Interfaces: Topics & Services
+## 3. ROS 2 Interface Summary
 
-| Interface Name | Type | Publisher / Server | Subscriber / Client | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `/scan` | `sensor_msgs/msg/LaserScan` | Gazebo Simulation | `lidar_obstacle_detector` | 360° LiDAR laser scan input |
-| `/obstacle_status` | `std_msgs/msg/Float32MultiArray` | `lidar_obstacle_detector` | `patrol_controller` | Array: `[front_min, left_min, right_min, obstacle_flag]` |
-| `/odom` | `nav_msgs/msg/Odometry` | Gazebo Simulation | `patrol_controller`, `telemetry_logger` | Robot odometry pose & velocity |
-| `/cmd_vel` | `geometry_msgs/msg/Twist` | `patrol_controller` | Gazebo Simulation, `telemetry_logger` | Linear and angular velocity commands |
-| `/trigger_estop` | `std_srvs/srv/SetBool` | `emergency_stop_server` | Operator / CLI | Service to activate (`true`) or clear (`false`) E-stop |
-| `/estop_state` | `std_msgs/msg/Bool` | `emergency_stop_server` | `patrol_controller`, `telemetry_logger` | Broadcasts current E-stop state at 10 Hz |
-| `/robot_telemetry` | `std_msgs/msg/String` | `telemetry_logger` | Telemetry Consumers | JSON telemetry string (distance, speed, battery) |
-| `/obstacle_markers` | `visualization_msgs/msg/MarkerArray` | `lidar_obstacle_detector` | RViz2 | RViz visual markers for obstacle indicator (Bonus) |
-| `/waypoint_markers` | `visualization_msgs/msg/MarkerArray` | `patrol_controller` | RViz2 | Visual path lines & current target waypoint (Bonus) |
+### Topics
 
----
+| Topic | Type | Publisher | Subscriber | Description |
+|---|---|---|---|---|
+| `/scan` | `sensor_msgs/msg/LaserScan` | Gazebo (`turtlebot3_laserscan`) | `lidar_obstacle_detector` | 360° 2D LiDAR range scan |
+| `/obstacle_status` | `std_msgs/msg/Float32MultiArray` | `lidar_obstacle_detector` | `patrol_controller` | `[front, left, right]` minimum distances in meters |
+| `/odom` | `nav_msgs/msg/Odometry` | Gazebo (`turtlebot3_diff_drive`) | `patrol_controller`, `telemetry_logger` | Robot odometry pose and twist |
+| `/cmd_vel` | `geometry_msgs/msg/Twist` | `patrol_controller` | Gazebo (`turtlebot3_diff_drive`), `telemetry_logger` | Velocity commands |
+| `/estop_state` | `std_msgs/msg/Bool` | `emergency_stop_server` | `patrol_controller` | Emergency stop status (True=halted, False=operational) |
+| `/robot_telemetry` | `std_msgs/msg/String` | `telemetry_logger` | External / User | Live diagnostic summary string |
 
-## 4. Installation & Build
+### Services
 
-### Prerequisites
-- **Ubuntu Linux** (22.04 LTS recommended, or 24.04 LTS)
-- **ROS 2** (Humble Hawksbill or Jazzy Jalisco)
-- **TurtleBot3 Gazebo Packages**:
-  ```bash
-  sudo apt update
-  sudo apt install -y \
-    ros-$ROS_DISTRO-turtlebot3-gazebo \
-    ros-$ROS_DISTRO-turtlebot3-msgs \
-    ros-$ROS_DISTRO-turtlebot3-teleop \
-    ros-$ROS_DISTRO-visualization-msgs
-  ```
-
-### Build Instructions
-1. Create or navigate to your ROS 2 workspace:
-   ```bash
-   mkdir -p ~/ros2_ws/src
-   cd ~/ros2_ws/src
-   ```
-2. Clone this repository into `src`:
-   ```bash
-   git clone https://github.com/ApoorvaTiwari07/ros-task.git turtlebot_patrol
-   ```
-3. Install package dependencies:
-   ```bash
-   cd ~/ros2_ws
-   rosdep update
-   rosdep install --from-paths src --ignore-src -r -y
-   ```
-4. Build the package with `colcon`:
-   ```bash
-   colcon build --symlink-install --packages-select turtlebot_patrol
-   ```
-5. Source the workspace overlay:
-   ```bash
-   source install/setup.bash
-   ```
+| Service | Type | Server | Description |
+|---|---|---|---|
+| `/trigger_estop` | `std_srvs/srv/SetBool` | `emergency_stop_server` | Set `data: true` to halt robot, `data: false` to resume |
 
 ---
 
-## 5. Running the Simulation
+## 4. Prerequisites & Installation
 
-Set the TurtleBot3 model (e.g. `burger` or `waffle_pi`):
+### Environment Requirements
+- **OS**: Ubuntu 22.04 LTS
+- **ROS 2**: Humble Hawksbill
+- **Simulator**: Gazebo Classic 11
+- **Robot Model**: TurtleBot3 Burger
+
+### Setup & Build
 ```bash
+# Source ROS 2 environment
+source /opt/ros/humble/setup.bash
+
+# Ensure TurtleBot3 model variable is configured
 export TURTLEBOT3_MODEL=burger
+
+# Navigate to workspace and build
+cd ~/robot_ws
+colcon build --packages-select turtlebot_patrol
+source install/setup.bash
 ```
 
-Launch the complete autonomous patrol and simulation stack using the single unified launch file:
+---
+
+## 5. Execution Guide
+
+### Single-Command Unified Launch
+
+To start Gazebo, spawn the robot in the obstacle world, and launch all four autonomous nodes:
+
 ```bash
+source /opt/ros/humble/setup.bash
+source ~/robot_ws/install/setup.bash
+export TURTLEBOT3_MODEL=burger
 ros2 launch turtlebot_patrol patrol_simulation.launch.py
 ```
 
-To enable RViz2 visualization side-by-side with Gazebo:
+*To run in headless mode (without opening the Gazebo GUI window):*
 ```bash
-ros2 launch turtlebot_patrol patrol_simulation.launch.py rviz:=true
+ros2 launch turtlebot_patrol patrol_simulation.launch.py gui:=false
 ```
 
----
+### Emergency Stop Controls
 
-## 6. Verification & Testing
+Open a second terminal:
 
-Open separate terminal tabs (ensure you have sourced `install/setup.bash` in each).
-
-### Step 1: Verify Active Nodes & Graph
-Check that all four nodes are running and communicating:
-```bash
-ros2 node list
-```
-*Expected Output:*
-```text
-/emergency_stop_server
-/gazebo
-/lidar_obstacle_detector
-/patrol_controller
-/telemetry_logger
-```
-
-### Step 2: Observe Autonomous Square Patrol
-Watch the TurtleBot3 traverse its configured square waypoints:
-`(0.0, 0.0) -> (2.0, 0.0) -> (2.0, 2.0) -> (0.0, 2.0) -> (0.0, 0.0)`
-The controller automatically advances waypoints upon reaching within `0.20m`.
-
-### Step 3: Test Obstacle Avoidance
-In Gazebo, insert a cylinder or box directly in front of the robot's path:
-- The `lidar_obstacle_detector` flags the obstacle when distance is `< 0.50m`.
-- The robot halts forward linear motion (`linear.x = 0.0`).
-- The robot evaluates left vs. right sector clearance and rotates toward the more open side.
-- Once the front sector clears (`>= 0.65m`), the robot smoothly resumes patrol toward its target waypoint.
-
-Check obstacle status topic:
-```bash
-ros2 topic echo /obstacle_status
-```
-*Output format: `data: [front_distance, left_distance, right_distance, obstacle_flag]`*
-
-### Step 4: Test Emergency Stop Service
-#### Activate E-Stop (Immediate Halt):
+**1. Activate Emergency Stop (robot halts immediately):**
 ```bash
 ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: true}"
 ```
-*Expected Response:*
-```text
-response:
-  success: True
-  message: 'EMERGENCY STOP ACTIVATED: Robot halted immediately.'
-```
-The robot immediately stops all motion (`cmd_vel: linear.x = 0.0, angular.z = 0.0`).
 
-#### Clear E-Stop (Resume Patrol):
+**2. Release Emergency Stop (robot resumes patrolling):**
 ```bash
 ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: false}"
 ```
-*Expected Response:*
-```text
-response:
-  success: True
-  message: 'EMERGENCY STOP CLEARED: Robot resumed normal patrol.'
-```
-The robot resumes its patrol trajectory toward the next target waypoint.
 
-### Step 5: Verify Telemetry Logging & CSV Output
-Echo the telemetry topic:
+### Monitoring Telemetry
+
+**Live topic stream:**
 ```bash
 ros2 topic echo /robot_telemetry
 ```
-*Sample JSON telemetry:*
-```json
-{
-  "timestamp": 124.50,
-  "distance_travelled_m": 6.842,
-  "current_speed_mps": 0.200,
-  "avg_speed_mps": 0.187,
-  "battery_percent": 96.6,
-  "motion_time_sec": 34.2,
-  "is_moving": true,
-  "estop_active": false
-}
-```
 
-View the generated CSV log:
+**Check CSV log file:**
 ```bash
-tail -n 10 telemetry_log.csv
-```
-*CSV format:*
-```csv
-timestamp_sec,distance_travelled_m,current_speed_mps,avg_speed_mps,battery_percent,motion_time_sec,is_moving,estop_active
-124.50,6.842,0.200,0.187,96.6,34.2,True,False
-```
-
-### Step 6: Run Automated Unit Tests
-```bash
-colcon test --packages-select turtlebot_patrol
-colcon test-result --verbose
+cat ~/robot_ws/telemetry_log.csv
 ```
 
 ---
 
-## 7. Demonstration Images
+## 6. Configuration Parameters
 
-### Image 1: Gazebo Simulation World & Patrol Route
-![Gazebo Patrol Route](docs/images/gazebo_simulation.png)
-*TurtleBot3 Burger navigating the autonomous square patrol route inside the Gazebo obstacle world.*
+All parameters are located in `config/patrol_params.yaml`:
 
-### Image 2: Dynamic LiDAR Obstacle Detection & Avoidance
-![LiDAR Avoidance](docs/images/obstacle_avoidance.png)
-*Front sector obstacle flagged below 0.5m threshold; robot autonomously turning toward the open clearance sector.*
+```yaml
+lidar_obstacle_detector:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38  # Calibrated detection distance (m)
+    max_range: 3.5                     # Sensor range limit fallback
+    front_angle_min_deg: -22.0         # Calibrated front sector for corridor clearance
+    front_angle_max_deg: 22.0
+    left_angle_min_deg: 22.0
+    left_angle_max_deg: 90.0
+    right_angle_min_deg: -90.0
+    right_angle_max_deg: -22.0
 
-### Image 3: Emergency Stop Service & Telemetry Console Output
-![E-Stop and Telemetry](docs/images/estop_and_telemetry.png)
-*Terminal showing invocation of `/trigger_estop`, immediate velocity suppression, and continuous telemetry logging.*
+patrol_controller:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38  # Enter avoidance when front < 0.38m
+    safe_resume_distance: 0.48         # Hysteresis exit: resume when front >= 0.48m
+    linear_speed: 0.12                 # Patrol cruising velocity (m/s)
+    angular_speed: 0.28                # Smooth turning velocity (rad/s)
+    waypoint_tolerance: 0.18           # Acceptance radius per waypoint (m)
+    stuck_timeout: 3.0                 # Timeout detecting zero progress
+    max_recovery_attempts: 3           # Retries before safe BLOCKED state
+    scan_timeout: 1.5                  # Safety watchdog timeouts
+    odom_timeout: 1.5
+    waypoints: [-2.0, -0.5, -1.4, -0.5, -1.4, 0.5, -2.0, 0.5]
+
+emergency_stop_server:
+  ros__parameters:
+    publish_rate: 10.0               # State publishing frequency (Hz)
+
+telemetry_logger:
+  ros__parameters:
+    telemetry_period: 1.0            # Logging interval (seconds)
+    initial_battery: 100.0           # Starting battery percentage
+    battery_drain_rate: 0.1          # Drain (%/s) while robot is in motion
+    csv_file_path: "/home/rockstar/robot_ws/telemetry_log.csv"
+```
 
 ---
 
-## 8. Docker Deployment (Bonus / Extra Credit)
+## 7. Troubleshooting
 
-For fully reproducible execution without local ROS 2 installation, build and run via Docker:
-
-```bash
-cd docker
-docker compose build
-docker compose up
-```
-
-Inside the container, test E-stop in an interactive shell:
-```bash
-docker exec -it turtlebot_patrol_sim bash
-ros2 service call /trigger_estop std_srvs/srv/SetBool "{data: true}"
-```
-
+| Symptom | Probable Cause | Remedy |
+|---|---|---|
+| `entity [burger] already exists` | A previous Gazebo instance crashed or was closed without cleaning up. | Run `killall -9 gzserver gzclient` before launching. |
+| Robot spins continuously in place | Angle wrapping error or waypoint located inside an obstacle. | Verify waypoints in `patrol_params.yaml` avoid obstacle collision zones; ensure `lidar_obstacle_detector` normalizes angles to $[-\pi, \pi]$. |
+| Robot does not move on startup | No odometry or laser scan received. | Check `ros2 topic echo /odom --once` and verify `TURTLEBOT3_MODEL=burger` is exported. |
+| CSV log is empty | Path permission or buffering issue. | Logger uses `buffering=1` and periodic `flush()`. Verify write access to `~/robot_ws/`. |
 
 ---
 
-## 9. Authors & License
+## Demo Video
 
-- **Author**: Apoorva Tiwari
-- **Repository**: [github.com/ApoorvaTiwari07/ros-task](https://github.com/ApoorvaTiwari07/ros-task)
-- **License**: Apache License 2.0
+The one-minute demonstration recording covers autonomous waypoint patrolling, reactive LiDAR obstacle avoidance, and remote emergency stop activation/release on the TurtleBot3 Burger in Gazebo Classic.
+
+- **Google Drive Video Link**: [TurtleBot Patrol Demo Video (Google Drive)](VIDEO_LINK_PLACEHOLDER)
+
+---
+
+## 8. Demonstration Evidence
+
+The demonstration evidence directory is `docs/images/`.
+
+### 1. Patrol Navigation
+![Patrol Navigation](docs/images/patrol.png)
+*Robot tracking waypoints autonomously along the patrol route.*
+
+### 2. Obstacle Detection & Avoidance
+![Obstacle Avoidance](docs/images/avoidance.png)
+*LiDAR detects cylinder obstacle within 0.50 m and steers toward the clearer sector.*
+
+### 3. Emergency Stop State
+![Emergency Stop](docs/images/estop.png)
+*Robot immediately stopped with zero linear and angular velocities following `/trigger_estop` call.*
+
+> **Recording Notes for Final Submission**:
+> - Launch command: `ros2 launch turtlebot_patrol patrol_simulation.launch.py`
+> - Show terminal outputs for `/robot_telemetry` and `/trigger_estop` service calls.
+> - Capture screenshots for `docs/images/patrol.png`, `docs/images/avoidance.png`, and `docs/images/estop.png` during the 1-minute demo run.

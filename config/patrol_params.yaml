@@ -1,59 +1,46 @@
-/**:
-  ros__parameters:
-    use_sim_time: true
-
 lidar_obstacle_detector:
   ros__parameters:
-    use_sim_time: true
-    # Sector distance threshold in metres below which an obstacle is flagged
-    safety_distance_threshold: 0.5
-    # LiDAR sector boundaries in degrees
-    front_angle_min_deg: -30.0
-    front_angle_max_deg: 30.0
-    left_angle_min_deg: 30.0
+    obstacle_distance_threshold: 0.38
+    max_range: 3.5
+    front_angle_min_deg: -22.0
+    front_angle_max_deg: 22.0
+    left_angle_min_deg: 22.0
     left_angle_max_deg: 90.0
     right_angle_min_deg: -90.0
-    right_angle_max_deg: -30.0
-    # Publish RViz visualization markers
-    publish_markers: true
+    right_angle_max_deg: -22.0
+
+obstacle_detector:
+  ros__parameters:
+    obstacle_distance_threshold: 0.38
+    max_range: 3.5
+    front_angle_min_deg: -22.0
+    front_angle_max_deg: 22.0
+    left_angle_min_deg: 22.0
+    left_angle_max_deg: 90.0
+    right_angle_min_deg: -90.0
+    right_angle_max_deg: -22.0
 
 patrol_controller:
   ros__parameters:
-    use_sim_time: true
-    # Motion speeds
-    linear_speed: 0.20        # m/s
-    angular_speed: 0.60       # rad/s
-    # Obstacle avoidance parameters
-    obstacle_threshold: 0.50   # m - triggers avoidance rotation
-    clear_threshold: 0.65      # m - safe distance to resume patrol
-    avoid_angular_speed: 0.70  # rad/s - rotation speed during obstacle evasion
-    # Waypoint patrol parameters
-    square_size: 2.0           # m - size of square patrol route if waypoints not explicitly set
-    waypoint_tolerance: 0.20   # m - distance threshold to consider waypoint reached
-    heading_tolerance: 0.25    # rad - angular alignment threshold before translating
-    kp_linear: 0.5             # Proportional gain for linear velocity
-    kp_angular: 1.5            # Proportional gain for steering
-    control_rate: 10.0         # Hz
-    # Custom Waypoint list (flattened x1, y1, x2, y2, ...).
-    # Default is a 2m x 2m square patrol: (0,0) -> (2,0) -> (2,2) -> (0,2)
-    waypoints: [0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 2.0]
+    obstacle_distance_threshold: 0.38
+    safe_resume_distance: 0.48
+    linear_speed: 0.12
+    angular_speed: 0.28
+    square_size: 0.8
+    waypoint_tolerance: 0.18
+    stuck_timeout: 3.0
+    max_recovery_attempts: 3
+    scan_timeout: 1.5
+    odom_timeout: 1.5
+    waypoints: [-2.0, -0.5, -1.4, -0.5, -1.4, 0.5, -2.0, 0.5]
 
 emergency_stop_server:
   ros__parameters:
-    use_sim_time: true
-    initial_state: false       # Initially E-stop is inactive
-    publish_rate: 10.0         # Hz for /estop_state topic
+    publish_rate: 10.0
 
 telemetry_logger:
   ros__parameters:
-    use_sim_time: true
-    log_rate: 1.0              # Hz - CSV logging frequency
-    console_log_rate: 0.5      # Hz - console telemetry print frequency (every 2 seconds)
-    csv_log_path: "telemetry_log.csv"
-    # Battery simulation parameters
-    battery_start_percentage: 100.0
-    # 1% drain per 10 seconds of motion
-    seconds_per_battery_percent: 10.0
-    # Linear and angular velocity thresholds to detect active robot motion
-    motion_linear_threshold: 0.01   # m/s
-    motion_angular_threshold: 0.02  # rad/s
+    telemetry_period: 1.0
+    initial_battery: 100.0
+    battery_drain_rate: 0.1
+    csv_file_path: "telemetry_log.csv"

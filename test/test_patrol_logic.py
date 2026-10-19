@@ -36,13 +36,15 @@ class TestPatrolLogic(unittest.TestCase):
         self.assertTrue(math.isclose(total_dist, 4.0))
 
     def test_obstacle_avoidance_turn_decision(self):
-        # If left sector distance is greater than right sector distance, robot turns left (positive angular velocity)
+        # If left sector distance is greater than right sector distance,
+        # robot turns left (positive angular velocity)
         left_dist = 1.2
         right_dist = 0.4
         turn_dir = 1.0 if left_dist >= right_dist else -1.0
         self.assertEqual(turn_dir, 1.0)
 
-        # If right sector distance is greater, robot turns right (negative angular velocity)
+        # If right sector distance is greater,
+        # robot turns right (negative angular velocity)
         left_dist = 0.3
         right_dist = 0.9
         turn_dir = 1.0 if left_dist >= right_dist else -1.0

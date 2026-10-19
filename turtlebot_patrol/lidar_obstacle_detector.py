@@ -1,192 +1,145 @@
-#!/usr/bin/env python3
-"""
-lidar_obstacle_detector.py
-
-Perception node for TurtleBot3.
-- Subscribes to /scan (sensor_msgs/msg/LaserScan)
-- Partitions 360-degree LiDAR scan into Front (-30 to +30 deg),
-  Left (+30 to +90 deg), and Right (-90 to -30 deg) sectors.
-- Computes minimum distance for each sector.
-- Publishes sector distances and obstacle flag on /obstacle_status.
-- Emits visualization markers on /obstacle_markers for RViz display.
-"""
-
 import math
-from typing import List, Tuple
+from typing import List
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray
-from visualization_msgs.msg import Marker, MarkerArray
 
 
 class LidarObstacleDetector(Node):
-    """Perception node partitioning LiDAR scans and reporting sector hazards."""
+    """
+    Subscribes to /scan and publishes sector obstacle distances.
 
-    def __init__(self) -> None:
+    Partitions the LiDAR field of view into Front, Left, and Right angular
+    sectors, and publishes the minimum obstacle distance for each sector on
+    /obstacle_status.
+    """
+
+    def __init__(self):
         super().__init__('lidar_obstacle_detector')
 
-        # Declare parameters
-        self.declare_parameter('safety_distance_threshold', 0.5)
-        self.declare_parameter('front_angle_min_deg', -30.0)
-        self.declare_parameter('front_angle_max_deg', 30.0)
-        self.declare_parameter('left_angle_min_deg', 30.0)
+        # Declare configurable parameters
+        self.declare_parameter('obstacle_distance_threshold', 0.38)
+        self.declare_parameter('max_range', 3.5)
+        self.declare_parameter('front_angle_min_deg', -22.0)
+        self.declare_parameter('front_angle_max_deg', 22.0)
+        self.declare_parameter('left_angle_min_deg', 22.0)
         self.declare_parameter('left_angle_max_deg', 90.0)
         self.declare_parameter('right_angle_min_deg', -90.0)
-        self.declare_parameter('right_angle_max_deg', -30.0)
-        self.declare_parameter('publish_markers', True)
+        self.declare_parameter('right_angle_max_deg', -22.0)
 
-        # Retrieve parameters
-        self.safety_threshold = float(
-            self.get_parameter('safety_distance_threshold').value
-        )
+        self.threshold = self.get_parameter(
+            'obstacle_distance_threshold').get_parameter_value().double_value
+        self.fallback_max_range = self.get_parameter(
+            'max_range').get_parameter_value().double_value
+
         self.front_min_rad = math.radians(
-            float(self.get_parameter('front_angle_min_deg').value)
-        )
+            self.get_parameter('front_angle_min_deg').value)
         self.front_max_rad = math.radians(
-            float(self.get_parameter('front_angle_max_deg').value)
-        )
+            self.get_parameter('front_angle_max_deg').value)
         self.left_min_rad = math.radians(
-            float(self.get_parameter('left_angle_min_deg').value)
-        )
+            self.get_parameter('left_angle_min_deg').value)
         self.left_max_rad = math.radians(
-            float(self.get_parameter('left_angle_max_deg').value)
-        )
+            self.get_parameter('left_angle_max_deg').value)
         self.right_min_rad = math.radians(
-            float(self.get_parameter('right_angle_min_deg').value)
-        )
+            self.get_parameter('right_angle_min_deg').value)
         self.right_max_rad = math.radians(
-            float(self.get_parameter('right_angle_max_deg').value)
-        )
-        self.publish_markers = bool(
-            self.get_parameter('publish_markers').value
-        )
+            self.get_parameter('right_angle_max_deg').value)
 
-        # Publishers
-        self.obstacle_pub = self.create_publisher(
+        self.publisher = self.create_publisher(
             Float32MultiArray, '/obstacle_status', 10
         )
-        self.marker_pub = self.create_publisher(
-            MarkerArray, '/obstacle_markers', 10
-        )
-
-        # Subscriber
-        self.scan_sub = self.create_subscription(
+        self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, 10
         )
 
+        self._logged_first_scan = False
+        f_deg = (math.degrees(self.front_min_rad), math.degrees(self.front_max_rad))
+        l_deg = (math.degrees(self.left_min_rad), math.degrees(self.left_max_rad))
+        r_deg = (math.degrees(self.right_min_rad), math.degrees(self.right_max_rad))
         self.get_logger().info(
-            f'LidarObstacleDetector initialized. Safety threshold: {self.safety_threshold}m'
+            f'LiDAR Obstacle Detector initialized (threshold={self.threshold:.2f}m, '
+            f'front=[{f_deg[0]:.0f}°, {f_deg[1]:.0f}°], '
+            f'left=[{l_deg[0]:.0f}°, {l_deg[1]:.0f}°], '
+            f'right=[{r_deg[0]:.0f}°, {r_deg[1]:.0f}°])'
         )
 
     @staticmethod
     def normalize_angle(angle: float) -> float:
-        """Normalize an angle into [-pi, +pi] interval."""
+        """Normalize any angle in radians to [-pi, +pi]."""
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def compute_sector_min(
-        self,
-        scan: LaserScan,
-        angle_min: float,
-        angle_max: float
-    ) -> float:
-        """
-        Calculate minimum valid distance in [angle_min, angle_max].
-        Handles angle wrapping across [-pi, pi].
-        """
-        valid_ranges: List[float] = []
-        angle_increment = scan.angle_increment
-        start_angle = scan.angle_min
+    def scan_callback(self, scan: LaserScan):
+        if not scan.ranges:
+            return
 
-        # If sector wraps around 0/bounds, determine bounds logic
-        is_crossing_zero = (angle_min > angle_max)
+        max_range = scan.range_max if (
+            math.isfinite(scan.range_max) and scan.range_max > 0.0
+        ) else self.fallback_max_range
+
+        min_range = scan.range_min if (
+            math.isfinite(scan.range_min) and scan.range_min >= 0.0
+        ) else 0.12
+
+        if not self._logged_first_scan:
+            self._logged_first_scan = True
+            self.get_logger().info(
+                f'Received first LiDAR scan: angle_min={scan.angle_min:.2f}, '
+                f'angle_max={scan.angle_max:.2f}, increment={scan.angle_increment:.4f}, '
+                f'range_min={scan.range_min:.2f}, range_max={scan.range_max:.2f}, '
+                f'samples={len(scan.ranges)}'
+            )
+
+        front_dists: List[float] = []
+        left_dists: List[float] = []
+        right_dists: List[float] = []
+
+        angle_min = scan.angle_min
+        angle_inc = scan.angle_increment
 
         for i, distance in enumerate(scan.ranges):
-            if not math.isfinite(distance):
-                continue
-            if distance < scan.range_min or distance > scan.range_max:
-                continue
+            # Calculate beam angle and normalize to [-pi, pi]
+            raw_angle = angle_min + i * angle_inc
+            angle = self.normalize_angle(raw_angle)
 
-            raw_angle = start_angle + i * angle_increment
-            norm_angle = self.normalize_angle(raw_angle)
-
-            if is_crossing_zero:
-                in_sector = (norm_angle >= angle_min or norm_angle <= angle_max)
+            # Check validity
+            if math.isfinite(distance):
+                if min_range <= distance <= max_range:
+                    valid_dist = distance
+                elif distance < min_range:
+                    # Reading too close or zero-return; treat as no-return / clear
+                    continue
+                else:
+                    valid_dist = max_range
+            elif math.isinf(distance) and distance > 0.0:
+                # Infinite reading = no obstacle detected up to max_range
+                valid_dist = max_range
             else:
-                in_sector = (angle_min <= norm_angle <= angle_max)
+                # NaN or negative reading
+                continue
 
-            if in_sector:
-                valid_ranges.append(distance)
+            # Assign to sector
+            if self.front_min_rad <= angle <= self.front_max_rad:
+                front_dists.append(valid_dist)
+            elif self.left_min_rad <= angle <= self.left_max_rad:
+                left_dists.append(valid_dist)
+            elif self.right_min_rad <= angle <= self.right_max_rad:
+                right_dists.append(valid_dist)
 
-        return min(valid_ranges) if valid_ranges else float('inf')
+        # Compute sector minimum distances, safely defaulting to max_range
+        front_val = float(min(front_dists)) if front_dists else max_range
+        left_val = float(min(left_dists)) if left_dists else max_range
+        right_val = float(min(right_dists)) if right_dists else max_range
 
-    def scan_callback(self, scan: LaserScan) -> None:
-        """Process incoming LaserScan message."""
-        # Calculate minimum distance in Front, Left, and Right sectors
-        front_min = self.compute_sector_min(scan, self.front_min_rad, self.front_max_rad)
-        left_min = self.compute_sector_min(scan, self.left_min_rad, self.left_max_rad)
-        right_min = self.compute_sector_min(scan, self.right_min_rad, self.right_max_rad)
-
-        # Flag an obstacle when the relevant distance is below the safety threshold
-        obstacle_flag = 1.0 if (front_min < self.safety_threshold) else 0.0
-
-        # Publish on /obstacle_status: [front, left, right, obstacle_flag]
         msg = Float32MultiArray()
-        msg.data = [
-            float(front_min),
-            float(left_min),
-            float(right_min),
-            float(obstacle_flag)
-        ]
-        self.obstacle_pub.publish(msg)
-
-        if self.publish_markers:
-            self.publish_rviz_markers(scan.header.frame_id or 'base_scan', front_min, obstacle_flag > 0.5)
-
-    def publish_rviz_markers(self, frame_id: str, front_dist: float, obstacle_flag: bool) -> None:
-        """Publish RViz markers for visualization of detected obstacles."""
-        marker_array = MarkerArray()
-
-        # Marker 1: Obstacle warning sphere in front of the robot
-        sphere_marker = Marker()
-        sphere_marker.header.frame_id = frame_id
-        sphere_marker.header.stamp = self.get_clock().now().to_msg()
-        sphere_marker.ns = 'obstacle_indicator'
-        sphere_marker.id = 0
-        sphere_marker.type = Marker.SPHERE
-        sphere_marker.action = Marker.ADD
-
-        # Distance representation (clamped for visual display)
-        disp_dist = min(front_dist, 2.5) if math.isfinite(front_dist) else 2.5
-        sphere_marker.pose.position.x = float(disp_dist)
-        sphere_marker.pose.position.y = 0.0
-        sphere_marker.pose.position.z = 0.1
-        sphere_marker.pose.orientation.w = 1.0
-
-        sphere_marker.scale.x = 0.3
-        sphere_marker.scale.y = 0.3
-        sphere_marker.scale.z = 0.3
-
-        if obstacle_flag:
-            sphere_marker.color.r = 1.0
-            sphere_marker.color.g = 0.1
-            sphere_marker.color.b = 0.1
-            sphere_marker.color.a = 0.9  # Red warning
-        else:
-            sphere_marker.color.r = 0.1
-            sphere_marker.color.g = 0.9
-            sphere_marker.color.b = 0.1
-            sphere_marker.color.a = 0.4  # Green clear
-
-        marker_array.markers.append(sphere_marker)
-        self.marker_pub.publish(marker_array)
+        msg.data = [front_val, left_val, right_val]
+        self.publisher.publish(msg)
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
     node = LidarObstacleDetector()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

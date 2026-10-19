@@ -1,96 +1,57 @@
-#!/usr/bin/env python3
-"""
-emergency_stop_server.py
-
-Safety service node for TurtleBot3.
-- Provides service /trigger_estop (std_srvs/srv/SetBool).
-  * true  -> Activates emergency-stop.
-  * false -> Clears emergency-stop.
-- Publishes the current state on /estop_state (std_msgs/msg/Bool).
-"""
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
-from std_srvs.srv import SetBool, Trigger
+from std_srvs.srv import SetBool
 
 
 class EmergencyStopServer(Node):
-    """Emergency stop safety service and publisher node."""
+    """
+    Emergency Stop Service and State Server for TurtleBot3.
 
-    def __init__(self) -> None:
+    Provides /trigger_estop service (std_srvs/srv/SetBool) and publishes
+    continuous state on /estop_state (std_msgs/msg/Bool).
+    """
+
+    def __init__(self):
         super().__init__('emergency_stop_server')
 
-        # Parameters
-        self.declare_parameter('initial_state', False)
+        # Declare configurable parameters
         self.declare_parameter('publish_rate', 10.0)
+        rate = self.get_parameter('publish_rate').value
 
-        self.estop_active = bool(self.get_parameter('initial_state').value)
-        publish_rate = float(self.get_parameter('publish_rate').value)
+        self.stopped = False
 
-        # Service /trigger_estop using SetBool
-        self.srv_set_bool = self.create_service(
-            SetBool, '/trigger_estop', self.handle_trigger_estop
+        self.publisher = self.create_publisher(
+            Bool, '/estop_state', 10
         )
-
-        # Optional Trigger fallback service /trigger_estop_toggle for convenience
-        self.srv_trigger = self.create_service(
-            Trigger, '/trigger_estop_toggle', self.handle_trigger_toggle
+        self.service = self.create_service(
+            SetBool, '/trigger_estop', self.handle_estop
         )
+        self.timer = self.create_timer(1.0 / rate, self.publish_state)
+        self.get_logger().info('Emergency Stop Service ready on /trigger_estop')
 
-        # Publisher for /estop_state
-        self.estop_pub = self.create_publisher(Bool, '/estop_state', 10)
-
-        # Timer to regularly broadcast estop state
-        timer_period = 1.0 / max(publish_rate, 1.0)
-        self.timer = self.create_timer(timer_period, self.publish_state)
-
-        self.get_logger().info(
-            f'EmergencyStopServer active. Initial state: {self.estop_active}'
-        )
-
-    def publish_state(self) -> None:
-        """Publish current E-stop state to /estop_state."""
+    def publish_state(self):
         msg = Bool()
-        msg.data = self.estop_active
-        self.estop_pub.publish(msg)
+        msg.data = self.stopped
+        self.publisher.publish(msg)
 
-    def handle_trigger_estop(
-        self, request: SetBool.Request, response: SetBool.Response
-    ) -> SetBool.Response:
-        """Handle SetBool requests: true activates, false clears."""
-        self.estop_active = bool(request.data)
-        self.publish_state()
-
-        if self.estop_active:
-            response.success = True
-            response.message = 'EMERGENCY STOP ACTIVATED: Robot halted immediately.'
-            self.get_logger().warn(response.message)
-        else:
-            response.success = True
-            response.message = 'EMERGENCY STOP CLEARED: Robot resumed normal patrol.'
-            self.get_logger().info(response.message)
-
-        return response
-
-    def handle_trigger_toggle(
-        self, request: Trigger.Request, response: Trigger.Response
-    ) -> Trigger.Response:
-        """Toggle emergency stop state via Trigger interface."""
-        self.estop_active = not self.estop_active
-        self.publish_state()
-
-        state_str = 'ACTIVATED' if self.estop_active else 'CLEARED'
+    def handle_estop(self, request, response):
+        self.stopped = bool(request.data)
         response.success = True
-        response.message = f'Emergency stop toggled to {state_str}.'
-        self.get_logger().info(response.message)
+        if self.stopped:
+            response.message = 'Emergency stop ACTIVE'
+            self.get_logger().warn('Emergency stop triggered: STOPPING ROBOT')
+        else:
+            response.message = 'Emergency stop RELEASED'
+            self.get_logger().info('Emergency stop released: RESUMING OPERATION')
+
+        self.publish_state()
         return response
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
     node = EmergencyStopServer()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

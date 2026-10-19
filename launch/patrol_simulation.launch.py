@@ -1,153 +1,137 @@
-#!/usr/bin/env python3
-"""
-patrol_simulation.launch.py
-
-Unified launch file for Autonomous TurtleBot Patrol & Obstacle Avoidance:
-1. Launches TurtleBot3 in Gazebo world with obstacles.
-2. Starts emergency_stop_server node.
-3. Starts lidar_obstacle_detector node.
-4. Starts patrol_controller node.
-5. Starts telemetry_logger node.
-6. Optionally starts RViz2 with visualization markers.
-
-Usage:
-    ros2 launch turtlebot_patrol patrol_simulation.launch.py
-    ros2 launch turtlebot_patrol patrol_simulation.launch.py rviz:=true
-"""
-
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    IncludeLaunchDescription,
-    SetEnvironmentVariable,
-)
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     pkg_turtlebot_patrol = get_package_share_directory('turtlebot_patrol')
     pkg_turtlebot3_gazebo = get_package_share_directory('turtlebot3_gazebo')
+    pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
 
-    # Launch Configurations
+    # Default parameters file
+    default_params_file = os.path.join(
+        pkg_turtlebot_patrol, 'config', 'patrol_params.yaml'
+    )
+
+    # Launch configuration variables
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
-    model = LaunchConfiguration('model', default='burger')
-    x_pose = LaunchConfiguration('x_pose', default='0.0')
-    y_pose = LaunchConfiguration('y_pose', default='0.0')
-    rviz_config_arg = LaunchConfiguration('rviz', default='false')
+    params_file = LaunchConfiguration('params_file', default=default_params_file)
+    gui = LaunchConfiguration('gui', default='true')
+    x_pose = LaunchConfiguration('x_pose', default='-2.0')
+    y_pose = LaunchConfiguration('y_pose', default='-0.5')
 
-    # Parameters file path
-    params_file = os.path.join(
-        pkg_turtlebot_patrol,
-        'config',
-        'patrol_params.yaml'
+    # Gazebo World file
+    world = os.path.join(
+        pkg_turtlebot3_gazebo, 'worlds', 'turtlebot3_world.world'
     )
 
-    # Ensure TURTLEBOT3_MODEL environment variable is burger if not already set
-    set_tb3_model = SetEnvironmentVariable(
-        name='TURTLEBOT3_MODEL',
-        value=model
+    # Ensure TURTLEBOT3_MODEL is burger
+    set_tb3_model_cmd = SetEnvironmentVariable(
+        name='TURTLEBOT3_MODEL', value='burger'
     )
 
-    # 1. Include TurtleBot3 Gazebo World (includes 9 obstacle pillars / cylinders)
-    tb3_gazebo_launch = IncludeLaunchDescription(
+    # Gazebo Server (simulation core)
+    gzserver_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(pkg_turtlebot3_gazebo, 'launch', 'turtlebot3_world.launch.py')
+            os.path.join(pkg_gazebo_ros, 'launch', 'gzserver.launch.py')
+        ),
+        launch_arguments={'world': world}.items()
+    )
+
+    # Gazebo Client (GUI)
+    gzclient_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_gazebo_ros, 'launch', 'gzclient.launch.py')
+        ),
+        condition=IfCondition(gui)
+    )
+
+    # Robot State Publisher
+    robot_state_publisher_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_turtlebot3_gazebo, 'launch', 'robot_state_publisher.launch.py')
+        ),
+        launch_arguments={'use_sim_time': use_sim_time}.items()
+    )
+
+    # Spawn TurtleBot3 Burger in Gazebo
+    spawn_turtlebot_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_turtlebot3_gazebo, 'launch', 'spawn_turtlebot3.launch.py')
         ),
         launch_arguments={
-            'use_sim_time': use_sim_time,
             'x_pose': x_pose,
-            'y_pose': y_pose,
+            'y_pose': y_pose
         }.items()
     )
 
-    # 2. Emergency Stop Service Node
-    emergency_stop_node = Node(
-        package='turtlebot_patrol',
-        executable='emergency_stop_server',
-        name='emergency_stop_server',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    # 3. LiDAR Obstacle Detector Node
-    lidar_detector_node = Node(
+    # 1. Perception Node
+    lidar_node = Node(
         package='turtlebot_patrol',
         executable='lidar_obstacle_detector',
         name='lidar_obstacle_detector',
         output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        parameters=[params_file, {'use_sim_time': use_sim_time}]
     )
 
-    # 4. Patrol Controller Node
-    patrol_controller_node = Node(
+    # 2. Control Node
+    controller_node = Node(
         package='turtlebot_patrol',
         executable='patrol_controller',
         name='patrol_controller',
         output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        parameters=[params_file, {'use_sim_time': use_sim_time}]
     )
 
-    # 5. Telemetry Logger Node
-    telemetry_logger_node = Node(
+    # 3. Emergency Stop Server
+    estop_node = Node(
+        package='turtlebot_patrol',
+        executable='emergency_stop_server',
+        name='emergency_stop_server',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}]
+    )
+
+    # 4. Telemetry Logger
+    telemetry_node = Node(
         package='turtlebot_patrol',
         executable='telemetry_logger',
         name='telemetry_logger',
         output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        parameters=[params_file, {'use_sim_time': use_sim_time}]
     )
 
-    # 6. Optional RViz2 Visualization Node
-    rviz_file = os.path.join(pkg_turtlebot_patrol, 'rviz', 'patrol.rviz')
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        output='screen',
-        arguments=['-d', rviz_file],
-        parameters=[{'use_sim_time': use_sim_time}],
-        condition=IfCondition(rviz_config_arg)
-    )
+    ld = LaunchDescription()
 
-    return LaunchDescription([
-        # Launch Arguments
-        DeclareLaunchArgument(
-            'use_sim_time',
-            default_value='true',
-            description='Use simulation (Gazebo) clock if true'
-        ),
-        DeclareLaunchArgument(
-            'model',
-            default_value='burger',
-            description='TurtleBot3 model: burger, waffle, or waffle_pi'
-        ),
-        DeclareLaunchArgument(
-            'x_pose',
-            default_value='0.0',
-            description='Initial x spawn position in world'
-        ),
-        DeclareLaunchArgument(
-            'y_pose',
-            default_value='0.0',
-            description='Initial y spawn position in world'
-        ),
-        DeclareLaunchArgument(
-            'rviz',
-            default_value='false',
-            description='Launch RViz2 for visualization'
-        ),
+    # Declare arguments
+    ld.add_action(set_tb3_model_cmd)
+    ld.add_action(DeclareLaunchArgument('use_sim_time', default_value='true',
+                                        description='Use simulation (Gazebo) clock'))
+    ld.add_action(DeclareLaunchArgument('params_file', default_value=default_params_file,
+                                        description='Path to ROS 2 parameters YAML'))
+    ld.add_action(DeclareLaunchArgument('gui', default_value='true',
+                                        description='Set to false to run headless'))
+    ld.add_action(DeclareLaunchArgument('x_pose', default_value='-2.0',
+                                        description='Initial x spawn coordinate'))
+    ld.add_action(DeclareLaunchArgument('y_pose', default_value='-0.5',
+                                        description='Initial y spawn coordinate'))
 
-        set_tb3_model,
-        tb3_gazebo_launch,
-        emergency_stop_node,
-        lidar_detector_node,
-        patrol_controller_node,
-        telemetry_logger_node,
-        rviz_node,
-    ])
+    # Add simulation actions
+    ld.add_action(gzserver_cmd)
+    ld.add_action(gzclient_cmd)
+    ld.add_action(robot_state_publisher_cmd)
+    ld.add_action(spawn_turtlebot_cmd)
+
+    # Add software stack nodes
+    ld.add_action(lidar_node)
+    ld.add_action(controller_node)
+    ld.add_action(estop_node)
+    ld.add_action(telemetry_node)
+
+    return ld

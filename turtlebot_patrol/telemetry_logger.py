@@ -1,215 +1,152 @@
-#!/usr/bin/env python3
-"""
-telemetry_logger.py
-
-Diagnostics & Logging node for TurtleBot3.
-- Subscribes to /odom, /cmd_vel, and /estop_state.
-- Calculates total distance travelled from odometry.
-- Calculates average linear speed.
-- Simulates battery drain (1% per 10 seconds of motion starting from 100%).
-- Publishes /robot_telemetry (std_msgs/msg/String).
-- Prints telemetry to console and periodically logs to telemetry_log.csv.
-"""
-
 import csv
-import json
 import math
 import os
-from typing import Optional
+import time
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 
 
 class TelemetryLogger(Node):
-    """Subscribes to robot motion feeds, computes statistics, and logs telemetry."""
+    """
+    Subscribes to /odom and /cmd_vel and logs robot telemetry.
 
-    def __init__(self) -> None:
+    Calculates cumulative distance travelled, average linear speed, and battery
+    drain during motion. Publishes formatted telemetry to /robot_telemetry
+    (std_msgs/msg/String) and records timestamped entries to a CSV file.
+    """
+
+    def __init__(self):
         super().__init__('telemetry_logger')
 
-        # Parameters
-        self.declare_parameter('log_rate', 1.0)                      # Hz for CSV logging
-        self.declare_parameter('console_log_rate', 0.5)              # Hz for console print (every 2s)
-        self.declare_parameter('csv_log_path', 'telemetry_log.csv')
-        self.declare_parameter('battery_start_percentage', 100.0)
-        self.declare_parameter('seconds_per_battery_percent', 10.0)
-        self.declare_parameter('motion_linear_threshold', 0.01)
-        self.declare_parameter('motion_angular_threshold', 0.02)
+        # Declare configurable parameters
+        self.declare_parameter('telemetry_period', 1.0)
+        self.declare_parameter('initial_battery', 100.0)
+        self.declare_parameter('battery_drain_rate', 0.1)  # % drain per second of motion
+        self.declare_parameter(
+            'csv_file_path',
+            os.path.expanduser('~/robot_ws/telemetry_log.csv')
+        )
 
-        self.csv_log_path = str(self.get_parameter('csv_log_path').value)
-        self.battery_percent = float(self.get_parameter('battery_start_percentage').value)
-        self.seconds_per_pct = float(self.get_parameter('seconds_per_battery_percent').value)
-        self.linear_thresh = float(self.get_parameter('motion_linear_threshold').value)
-        self.angular_thresh = float(self.get_parameter('motion_angular_threshold').value)
-        log_rate = float(self.get_parameter('log_rate').value)
-        console_rate = float(self.get_parameter('console_log_rate').value)
+        self.period = self.get_parameter('telemetry_period').value
+        self.battery = float(self.get_parameter('initial_battery').value)
+        self.drain_rate = float(self.get_parameter('battery_drain_rate').value)
+        self.csv_path = os.path.expanduser(
+            self.get_parameter('csv_file_path').value)
 
-        # Telemetry variables
+        # Odometry tracking
         self.total_distance = 0.0
-        self.prev_x: Optional[float] = None
-        self.prev_y: Optional[float] = None
-        self.current_speed = 0.0
-        self.current_angular_speed = 0.0
-        self.total_motion_time = 0.0
+        self.last_position = None
+        self.motion_time_sec = 0.0
+        self.last_update_time = time.time()
+
+        # Motion status
         self.is_moving = False
-        self.estop_active = False
+        self.current_linear_speed = 0.0
+        self.current_angular_speed = 0.0
 
-        # Time tracking
-        self.last_update_time = self.get_clock().now()
-        self.last_console_time = self.get_clock().now()
-
-        # Publishers
-        self.telemetry_pub = self.create_publisher(String, '/robot_telemetry', 10)
-
-        # Subscribers
+        # Subscriptions and Publishers
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
-        self.create_subscription(Bool, '/estop_state', self.estop_callback, 10)
-
-        # Initialize CSV file with header if it doesn't exist
-        self.init_csv_file()
-
-        # Timer for periodic logging and publishing
-        self.timer = self.create_timer(1.0 / max(log_rate, 0.1), self.timer_callback)
-
-        self.get_logger().info(
-            f'TelemetryLogger active. Logging to {os.path.abspath(self.csv_log_path)}'
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_callback, 10)
+        self.publisher = self.create_publisher(
+            String, '/robot_telemetry', 10
         )
 
-    def init_csv_file(self) -> None:
-        """Create CSV file and write header row if not already present."""
+        # CSV initialization
+        csv_dir = os.path.dirname(self.csv_path)
+        if csv_dir and not os.path.exists(csv_dir):
+            try:
+                os.makedirs(csv_dir, exist_ok=True)
+            except OSError:
+                self.csv_path = 'telemetry_log.csv'
+
         try:
-            file_exists = os.path.exists(self.csv_log_path) and os.path.getsize(self.csv_log_path) > 0
-            with open(self.csv_log_path, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow([
-                        'timestamp_sec',
-                        'distance_travelled_m',
-                        'current_speed_mps',
-                        'avg_speed_mps',
-                        'battery_percent',
-                        'motion_time_sec',
-                        'is_moving',
-                        'estop_active'
-                    ])
-        except Exception as e:
-            self.get_logger().error(f'Failed to initialize CSV log: {e}')
+            self.csv_file = open(self.csv_path, 'w', newline='', buffering=1)
+        except OSError:
+            self.csv_path = 'telemetry_log.csv'
+            self.csv_file = open(self.csv_path, 'w', newline='', buffering=1)
+        self.writer = csv.writer(self.csv_file)
+        self.writer.writerow([
+            'timestamp', 'distance_m', 'average_speed_m_s', 'battery_percent'
+        ])
+        self.csv_file.flush()
 
-    def odom_callback(self, msg: Odometry) -> None:
-        """Track distance travelled from odometry updates."""
-        curr_x = msg.pose.pose.position.x
-        curr_y = msg.pose.pose.position.y
-
-        if self.prev_x is not None and self.prev_y is not None:
-            delta_dist = math.hypot(curr_x - self.prev_x, curr_y - self.prev_y)
-            # Filter noise and large teleports
-            if 0.0005 < delta_dist < 1.0:
-                self.total_distance += delta_dist
-
-        self.prev_x = curr_x
-        self.prev_y = curr_y
-
-        # Update instantaneous linear speed from odometry
-        odom_speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
-        if odom_speed > 0.001:
-            self.current_speed = odom_speed
-
-    def cmd_vel_callback(self, msg: Twist) -> None:
-        """Track commanding velocities to accurately detect motion."""
-        cmd_linear = abs(msg.linear.x)
-        cmd_angular = abs(msg.angular.z)
-        self.current_angular_speed = cmd_angular
-
-        # If odom hasn't registered yet, use command velocity
-        if self.current_speed <= 0.001:
-            self.current_speed = cmd_linear
-
-        # Robot is moving if linear or angular speed exceeds threshold
-        self.is_moving = (
-            cmd_linear > self.linear_thresh or cmd_angular > self.angular_thresh
+        self.timer = self.create_timer(self.period, self.log_telemetry)
+        self.get_logger().info(
+            f'Telemetry Logger started. Logging every {self.period:.1f}s to {self.csv_path}'
         )
 
-    def estop_callback(self, msg: Bool) -> None:
-        """Track E-Stop state."""
-        self.estop_active = bool(msg.data)
-        if self.estop_active:
-            self.is_moving = False
-            self.current_speed = 0.0
+    def odom_callback(self, msg: Odometry):
+        pos = msg.pose.pose.position
+        curr = (pos.x, pos.y)
 
-    def timer_callback(self) -> None:
-        """Periodic telemetry calculation, publish, console print, and CSV logging."""
-        now = self.get_clock().now()
-        dt = (now - self.last_update_time).nanoseconds / 1e9
+        if self.last_position is not None:
+            dx = curr[0] - self.last_position[0]
+            dy = curr[1] - self.last_position[1]
+            step_dist = math.hypot(dx, dy)
+            self.total_distance += step_dist
+
+        self.last_position = curr
+
+    def cmd_callback(self, msg: Twist):
+        self.current_linear_speed = abs(msg.linear.x)
+        self.current_angular_speed = abs(msg.angular.z)
+        self.is_moving = (
+            self.current_linear_speed > 0.005 or
+            self.current_angular_speed > 0.01
+        )
+
+    def log_telemetry(self):
+        now = time.time()
+        dt = now - self.last_update_time
         self.last_update_time = now
 
-        if dt > 0 and dt < 5.0:
-            if self.is_moving and not self.estop_active:
-                self.total_motion_time += dt
-                # Drain 1% every seconds_per_pct of motion
-                drain_amount = (dt / self.seconds_per_pct) * 1.0
-                self.battery_percent = max(0.0, self.battery_percent - drain_amount)
+        # Update battery and motion time only when robot is moving
+        if self.is_moving:
+            self.motion_time_sec += dt
+            self.battery = max(0.0, self.battery - self.drain_rate * dt)
 
-        # Average speed: total distance / total motion time (if motion has occurred)
+        # Average linear speed = total distance / active motion time
         avg_speed = (
-            (self.total_distance / self.total_motion_time)
-            if self.total_motion_time > 0.5
-            else self.current_speed
+            self.total_distance / self.motion_time_sec
+            if self.motion_time_sec > 0.1 else 0.0
         )
 
-        sim_time_sec = now.nanoseconds / 1e9
-
-        # 1. Publish JSON Telemetry Message
-        telemetry_data = {
-            'timestamp': round(sim_time_sec, 2),
-            'distance_travelled_m': round(self.total_distance, 3),
-            'current_speed_mps': round(self.current_speed, 3),
-            'avg_speed_mps': round(avg_speed, 3),
-            'battery_percent': round(self.battery_percent, 1),
-            'motion_time_sec': round(self.total_motion_time, 1),
-            'is_moving': self.is_moving,
-            'estop_active': self.estop_active
-        }
+        # Publish String message
+        telemetry_str = (
+            f"Distance: {self.total_distance:.2f} m | "
+            f"Avg Speed: {avg_speed:.2f} m/s | "
+            f"Battery: {self.battery:.1f}% | "
+            f"Moving: {self.is_moving}"
+        )
         msg = String()
-        msg.data = json.dumps(telemetry_data)
-        self.telemetry_pub.publish(msg)
+        msg.data = telemetry_str
+        self.publisher.publish(msg)
 
-        # 2. Console Telemetry Output (throttled every 2s)
-        console_dt = (now - self.last_console_time).nanoseconds / 1e9
-        if console_dt >= 2.0:
-            self.last_console_time = now
-            estop_str = 'HALTED' if self.estop_active else 'ACTIVE'
-            self.get_logger().info(
-                f'[TELEMETRY] Dist: {self.total_distance:.2f} m | '
-                f'Speed: {self.current_speed:.2f} m/s (Avg: {avg_speed:.2f} m/s) | '
-                f'Battery: {self.battery_percent:.1f}% | State: {estop_str}'
-            )
+        # Write to CSV
+        self.writer.writerow([
+            f"{now:.2f}",
+            f"{self.total_distance:.3f}",
+            f"{avg_speed:.3f}",
+            f"{self.battery:.2f}"
+        ])
+        self.csv_file.flush()
 
-        # 3. Write to CSV Log
-        try:
-            with open(self.csv_log_path, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    f'{sim_time_sec:.2f}',
-                    f'{self.total_distance:.3f}',
-                    f'{self.current_speed:.3f}',
-                    f'{avg_speed:.3f}',
-                    f'{self.battery_percent:.1f}',
-                    f'{self.total_motion_time:.1f}',
-                    self.is_moving,
-                    self.estop_active
-                ])
-        except Exception as e:
-            self.get_logger().warn(f'Error writing telemetry to CSV: {e}', throttle_duration_sec=5.0)
+        self.get_logger().info(f"[Telemetry] {telemetry_str}")
+
+    def destroy_node(self):
+        if hasattr(self, 'csv_file') and not self.csv_file.closed:
+            self.csv_file.flush()
+            self.csv_file.close()
+        super().destroy_node()
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
     node = TelemetryLogger()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
