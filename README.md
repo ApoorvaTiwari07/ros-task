@@ -234,7 +234,7 @@ The one-minute demonstration recording covers autonomous waypoint patrolling, re
 
 ## 8. Demonstration Evidence
 
-The demonstration evidence directory is `docs/images/`.
+The demonstration evidence directory is https://drive.google.com/drive/folders/1tQiVgO-dJoKQ8jO0A9U7wGsy_rBYEmas?usp=sharing
 
 ### 1. Patrol Navigation
 ![Patrol Navigation](docs/images/patrol.png)
